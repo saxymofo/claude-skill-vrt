@@ -1,0 +1,421 @@
+#!/usr/bin/env node
+/**
+ * VRT orchestrator.
+ *
+ * Workflow:
+ *  1. From the user's repo (cwd), find the merge-base with origin/main.
+ *  2. Ensure a sibling worktree at ../<repo>-vrt-main pointing at origin/main.
+ *  3. npm install in both the working tree and the worktree if needed.
+ *  4. Spawn two storybook instances on different ports.
+ *  5. Wait for both /index.json endpoints to come up.
+ *  6. Enumerate stories. Filter by changed files (default) or run all.
+ *  7. For each story, screenshot from both ports. Build a side-by-side
+ *     composite and a pixelmatch diff overlay.
+ *  8. Write a manifest.json describing every story's image paths.
+ *  9. Emit a single JSON status line on stdout, then exit. Storybooks
+ *     are killed on exit; the worktree stays warm.
+ */
+
+import { spawn, execSync } from "node:child_process";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+
+import pixelmatch from "pixelmatch";
+import pngjs from "pngjs";
+import { chromium } from "playwright";
+import sharp from "sharp";
+
+import { renderIndexHtml } from "./render-index.mjs";
+
+const { PNG } = pngjs;
+
+// ----- arg parsing -----
+const args = process.argv.slice(2);
+function flag(name) {
+	return args.includes(`--${name}`);
+}
+function valued(name, fallback) {
+	const i = args.findIndex((a) => a === `--${name}` || a.startsWith(`--${name}=`));
+	if (i === -1) return fallback;
+	const a = args[i];
+	if (a.includes("=")) return a.split("=", 2)[1];
+	return args[i + 1];
+}
+
+if (flag("help")) {
+	console.log(`vrt — visual regression test against origin/main
+
+Usage:
+  node vrt.mjs [--all] [--limit N] [--main-port 6006] [--branch-port 6007]
+
+Flags:
+  --all              compare every story (default: only stories whose source dir contains changed files)
+  --limit N          cap the number of stories
+  --main-port N      port for the origin/main storybook (default 6006)
+  --branch-port N    port for the working-branch storybook (default 6007)
+`);
+	process.exit(0);
+}
+
+const ALL = flag("all");
+const CHANGED_ONLY = !ALL;
+const LIMIT = Number(valued("limit", "0")) || 0;
+const MAIN_PORT = Number(valued("main-port", "6006"));
+const BRANCH_PORT = Number(valued("branch-port", "6007"));
+
+// ----- discover repo -----
+function sh(cmd, opts = {}) {
+	return execSync(cmd, { encoding: "utf8", ...opts }).trim();
+}
+
+const repoRoot = sh("git rev-parse --show-toplevel");
+const repoName = basename(repoRoot);
+
+// ----- guard: storybook script -----
+const pkgPath = join(repoRoot, "package.json");
+if (!existsSync(pkgPath)) {
+	console.error("No package.json in repo root. Aborting.");
+	process.exit(1);
+}
+const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+if (!pkg.scripts?.storybook) {
+	console.error(
+		'No "storybook" script in package.json. /vrt only supports repos with `npm run storybook`. Aborting.',
+	);
+	process.exit(1);
+}
+
+// ----- guard: HEAD vs origin/main -----
+console.error("Fetching origin/main…");
+sh("git fetch origin main --quiet", { cwd: repoRoot });
+const branchRef = sh("git rev-parse HEAD", { cwd: repoRoot });
+const mainRef = sh("git rev-parse origin/main", { cwd: repoRoot });
+const mergeBase = sh("git merge-base origin/main HEAD", { cwd: repoRoot });
+
+if (branchRef === mainRef) {
+	console.error("HEAD is already at origin/main; nothing to compare.");
+	process.exit(0);
+}
+
+// ----- worktree -----
+const worktreePath = resolve(repoRoot, "..", `${repoName}-vrt-main`);
+if (!existsSync(worktreePath)) {
+	console.error(`Creating worktree at ${worktreePath}…`);
+	sh(`git worktree add "${worktreePath}" origin/main`, { cwd: repoRoot });
+} else {
+	console.error(`Updating existing worktree at ${worktreePath}…`);
+	sh(`git -C "${worktreePath}" fetch origin main --quiet`, { cwd: repoRoot });
+	sh(`git -C "${worktreePath}" reset --hard origin/main`, { cwd: repoRoot });
+}
+
+// ----- install deps if needed -----
+function ensureDeps(dir) {
+	if (existsSync(join(dir, "node_modules"))) return;
+	console.error(`Installing dependencies in ${dir} (one-time, may take ~1 minute)…`);
+	// Prefer `npm ci` — uses the lockfile exactly, sidesteps peer-dep
+	// resolution. If the project lacks a lockfile or has a peer-dep
+	// conflict that even ci can't paper over, fall back to `npm install
+	// --legacy-peer-deps` which mirrors what npm does when peers don't
+	// quite align (a real-world thing in larger projects).
+	const ciCmd = "npm ci --prefer-offline --no-audit --no-fund";
+	const fallbackCmd =
+		"npm install --legacy-peer-deps --prefer-offline --no-audit --no-fund";
+	try {
+		execSync(ciCmd, { cwd: dir, stdio: "inherit" });
+	} catch {
+		console.error(
+			"`npm ci` failed; retrying with `npm install --legacy-peer-deps`…",
+		);
+		execSync(fallbackCmd, { cwd: dir, stdio: "inherit" });
+	}
+}
+ensureDeps(repoRoot);
+ensureDeps(worktreePath);
+
+// ----- storybook spawn -----
+function storybookBin(cwd) {
+	const local = join(cwd, "node_modules", ".bin", "storybook");
+	if (!existsSync(local)) {
+		throw new Error(`storybook binary not found at ${local}; run npm install in ${cwd}`);
+	}
+	return local;
+}
+
+function spawnStorybook(cwd, port, label) {
+	const bin = storybookBin(cwd);
+	const proc = spawn(bin, ["dev", "-p", String(port), "--ci", "--no-open"], {
+		cwd,
+		stdio: ["ignore", "pipe", "pipe"],
+		env: { ...process.env, NODE_ENV: "development", BROWSER: "none" },
+	});
+	const tag = `[sb:${label}]`;
+	proc.stdout.on("data", (b) => process.stderr.write(`${tag} ${b}`));
+	proc.stderr.on("data", (b) => process.stderr.write(`${tag} ${b}`));
+	proc.on("exit", (code) => {
+		if (code !== 0 && code !== null) {
+			process.stderr.write(`${tag} exited with code ${code}\n`);
+		}
+	});
+	return proc;
+}
+
+async function waitForStorybook(port, timeoutMs = 240_000) {
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		try {
+			const r = await fetch(`http://127.0.0.1:${port}/index.json`);
+			if (r.ok) return await r.json();
+		} catch {
+			// not yet
+		}
+		await sleep(500);
+	}
+	throw new Error(`storybook on port ${port} not ready within ${timeoutMs}ms`);
+}
+
+console.error(`Starting storybooks (main on :${MAIN_PORT}, branch on :${BRANCH_PORT})…`);
+const sbMain = spawnStorybook(worktreePath, MAIN_PORT, "main");
+const sbBranch = spawnStorybook(repoRoot, BRANCH_PORT, "branch");
+
+let cleanedUp = false;
+async function cleanup() {
+	if (cleanedUp) return;
+	cleanedUp = true;
+	for (const p of [sbMain, sbBranch]) {
+		try {
+			p.kill("SIGTERM");
+		} catch {
+			// ignore
+		}
+	}
+}
+process.on("SIGINT", () => {
+	cleanup().finally(() => process.exit(130));
+});
+process.on("SIGTERM", () => {
+	cleanup().finally(() => process.exit(143));
+});
+
+try {
+	console.error("Waiting for both storybooks to be ready…");
+	const [, branchIndex] = await Promise.all([
+		waitForStorybook(MAIN_PORT),
+		waitForStorybook(BRANCH_PORT),
+	]);
+
+	// ----- enumerate stories (use branch index as source of truth — new stories are
+	// what the user wants to see; deleted ones can't be screenshotted on the branch
+	// anyway). -----
+	const allEntries = Object.values(branchIndex.entries).filter(
+		(e) => e.type === "story",
+	);
+	console.error(`Total stories on working branch: ${allEntries.length}`);
+
+	// ----- changed-files filter -----
+	let stories;
+	if (CHANGED_ONLY) {
+		const changed = sh(`git diff --name-only ${mergeBase}...HEAD`, {
+			cwd: repoRoot,
+		})
+			.split("\n")
+			.filter(Boolean);
+		console.error(`Changed files since merge-base: ${changed.length}`);
+
+		stories = allEntries.filter((entry) => {
+			const importPath = entry.importPath.replace(/^\.\//, "");
+			const storyDir = dirname(importPath);
+			return changed.some(
+				(f) => f === importPath || f.startsWith(`${storyDir}/`),
+			);
+		});
+		console.error(
+			`Stories whose source dir contains changed files: ${stories.length}`,
+		);
+	} else {
+		stories = allEntries;
+	}
+
+	if (LIMIT > 0 && stories.length > LIMIT) {
+		stories = stories.slice(0, LIMIT);
+		console.error(`Capped to --limit ${LIMIT}.`);
+	}
+
+	if (stories.length === 0) {
+		console.error(
+			"No stories matched. Use --all to compare every story regardless of file changes.",
+		);
+		await cleanup();
+		console.log(JSON.stringify({ storyCount: 0, manifestPath: null, outDir: null }));
+		process.exit(0);
+	}
+
+	// ----- output dir -----
+	const runId = new Date()
+		.toISOString()
+		.replace(/[:.]/g, "-")
+		.replace(/Z$/, "");
+	const outDir = `/tmp/vrt-${runId}`;
+	mkdirSync(join(outDir, "stories"), { recursive: true });
+	console.error(`Output directory: ${outDir}`);
+
+	// ----- screenshot loop -----
+	const browser = await chromium.launch();
+	const context = await browser.newContext({
+		viewport: { width: 1280, height: 720 },
+		reducedMotion: "reduce",
+		deviceScaleFactor: 1,
+	});
+
+	async function screenshotStory(port, storyId, outPath) {
+		const page = await context.newPage();
+		try {
+			const url = `http://127.0.0.1:${port}/iframe.html?id=${encodeURIComponent(
+				storyId,
+			)}&viewMode=story`;
+			await page.goto(url, { waitUntil: "networkidle", timeout: 30_000 });
+			// Belt-and-suspenders: networkidle isn't always enough.
+			await page.evaluate(() =>
+				document.fonts ? document.fonts.ready : Promise.resolve(),
+			);
+			await sleep(300);
+			await page.screenshot({ path: outPath, fullPage: false });
+		} finally {
+			await page.close();
+		}
+	}
+
+	const manifest = {
+		runId,
+		repo: repoRoot,
+		mainRef,
+		branchRef,
+		mergeBase,
+		generatedAt: new Date().toISOString(),
+		stories: [],
+	};
+
+	for (const [i, entry] of stories.entries()) {
+		const safeId = entry.id.replace(/[^a-z0-9-]/gi, "_");
+		const storyDir = join(outDir, "stories", safeId);
+		mkdirSync(storyDir, { recursive: true });
+
+		const mainPath = join(storyDir, "main.png");
+		const branchPath = join(storyDir, "branch.png");
+		const compositePath = join(storyDir, "composite.png");
+		const diffPath = join(storyDir, "diff.png");
+
+		process.stderr.write(
+			`[${i + 1}/${stories.length}] ${entry.title} :: ${entry.name}… `,
+		);
+
+		try {
+			await screenshotStory(MAIN_PORT, entry.id, mainPath);
+			await screenshotStory(BRANCH_PORT, entry.id, branchPath);
+
+			// Composite: side-by-side, main left | branch right, 4px black gutter.
+			const [mainMeta, branchMeta] = await Promise.all([
+				sharp(mainPath).metadata(),
+				sharp(branchPath).metadata(),
+			]);
+			const w = Math.max(mainMeta.width || 0, branchMeta.width || 0);
+			const h = Math.max(mainMeta.height || 0, branchMeta.height || 0);
+
+			await sharp({
+				create: {
+					width: w * 2 + 4,
+					height: h,
+					channels: 3,
+					background: { r: 0, g: 0, b: 0 },
+				},
+			})
+				.composite([
+					{ input: mainPath, left: 0, top: 0 },
+					{ input: branchPath, left: w + 4, top: 0 },
+				])
+				.png()
+				.toFile(compositePath);
+
+			// Pixel diff. Crop to common dimensions if they differ.
+			const png1 = PNG.sync.read(readFileSync(mainPath));
+			const png2 = PNG.sync.read(readFileSync(branchPath));
+			let pixelDiffPercent = null;
+			if (png1.width === png2.width && png1.height === png2.height) {
+				const diff = new PNG({ width: png1.width, height: png1.height });
+				const numDiff = pixelmatch(
+					png1.data,
+					png2.data,
+					diff.data,
+					png1.width,
+					png1.height,
+					{ threshold: 0.1, includeAA: false, alpha: 0.3 },
+				);
+				writeFileSync(diffPath, PNG.sync.write(diff));
+				pixelDiffPercent = (numDiff / (png1.width * png1.height)) * 100;
+			} else {
+				// Mismatched dimensions — meaningful change; record without diff overlay.
+				pixelDiffPercent = null;
+			}
+
+			manifest.stories.push({
+				id: entry.id,
+				title: entry.title,
+				name: entry.name,
+				importPath: entry.importPath,
+				files: {
+					main: mainPath,
+					branch: branchPath,
+					composite: compositePath,
+					diff: pixelDiffPercent === null ? null : diffPath,
+				},
+				dimensions: {
+					main: { w: mainMeta.width, h: mainMeta.height },
+					branch: { w: branchMeta.width, h: branchMeta.height },
+				},
+				pixelDiffPercent,
+			});
+			process.stderr.write(
+				`ok${pixelDiffPercent === null ? " (size mismatch)" : ` (${pixelDiffPercent.toFixed(2)}% px diff)`}\n`,
+			);
+		} catch (err) {
+			manifest.stories.push({
+				id: entry.id,
+				title: entry.title,
+				name: entry.name,
+				importPath: entry.importPath,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			process.stderr.write(`error: ${err.message}\n`);
+		}
+	}
+
+	await browser.close();
+
+	const manifestPath = join(outDir, "manifest.json");
+	writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+	// Self-contained HTML index so the user can browse composites in a
+	// browser without spinning up a server. Single file, no external CSS
+	// or JS, references the per-story PNGs via relative paths.
+	const indexPath = join(outDir, "index.html");
+	writeFileSync(indexPath, renderIndexHtml(manifest, outDir));
+
+	// Final handoff line for the agent.
+	console.log(
+		JSON.stringify({
+			manifestPath,
+			indexPath,
+			indexUrl: `file://${indexPath}`,
+			outDir,
+			storyCount: stories.length,
+			erroredCount: manifest.stories.filter((s) => s.error).length,
+		}),
+	);
+} finally {
+	await cleanup();
+}

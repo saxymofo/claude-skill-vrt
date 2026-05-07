@@ -1,0 +1,13 @@
+{
+	"name": "vrt-skill",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Visual regression test orchestrator — spawns paired storybooks (working branch + origin/main worktree), screenshots stories, emits side-by-side composites and pixel diffs.",
+	"dependencies": {
+		"pixelmatch": "^7.1.0",
+		"playwright": "^1.48.0",
+		"pngjs": "^7.0.0",
+		"sharp": "^0.33.0"
+	}
+}
