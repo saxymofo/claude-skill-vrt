@@ -43,7 +43,7 @@ The agent reports back grouped by component with per-story summaries and an `ind
 ## Output layout
 
 ```
-/tmp/vrt-<run-id>/
+<repo>/.vrt/<run-id>/
 ├── index.html            # browsable report
 ├── manifest.json         # machine-readable
 └── stories/
@@ -53,6 +53,11 @@ The agent reports back grouped by component with per-story summaries and an `ind
         ├── composite.png # side-by-side (left=main, right=branch)
         └── diff.png      # pixelmatch overlay
 ```
+
+The output lives under `<repo>/.vrt/` (not `/tmp/`) so Claude Code's
+auto-allow-cwd permission model covers the agent's later Read calls
+without per-image prompts. The skill appends `.vrt/` to `.gitignore`
+automatically on first run.
 
 ## Out of scope
 

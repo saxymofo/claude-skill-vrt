@@ -260,9 +260,37 @@ try {
 		.toISOString()
 		.replace(/[:.]/g, "-")
 		.replace(/Z$/, "");
-	const outDir = `/tmp/vrt-${runId}`;
+	// Write into the working repo (not /tmp) so the agent's later Read
+	// calls land on cwd-relative paths — those are auto-allowed under
+	// Claude Code's default permission model. /tmp paths trigger a
+	// permission prompt for every Read and the report becomes painful
+	// to use.
+	const vrtDir = join(repoRoot, ".vrt");
+	const outDir = join(vrtDir, runId);
 	mkdirSync(join(outDir, "stories"), { recursive: true });
 	console.error(`Output directory: ${outDir}`);
+
+	// Add `.vrt/` to .gitignore on first run so the artifacts don't
+	// accidentally land in commits. Idempotent — append only if absent.
+	const gitignorePath = join(repoRoot, ".gitignore");
+	const gitignoreEntry = ".vrt/";
+	let gitignoreContents = "";
+	try {
+		gitignoreContents = readFileSync(gitignorePath, "utf8");
+	} catch {
+		// no .gitignore yet — we'll create one
+	}
+	const hasEntry = gitignoreContents
+		.split(/\r?\n/)
+		.some((line) => line.trim() === gitignoreEntry);
+	if (!hasEntry) {
+		const sep = gitignoreContents && !gitignoreContents.endsWith("\n") ? "\n" : "";
+		writeFileSync(
+			gitignorePath,
+			`${gitignoreContents}${sep}${gitignoreEntry}\n`,
+		);
+		console.error(`Added \`${gitignoreEntry}\` to .gitignore.`);
+	}
 
 	// ----- screenshot loop -----
 	const browser = await chromium.launch();

@@ -31,9 +31,14 @@ The orchestrator script (`scripts/vrt.mjs`) creates a sibling worktree at `origi
 
    The script prints a single JSON line on stdout at the end:
    ```json
-   {"manifestPath": "/tmp/vrt-<run>/manifest.json", "indexUrl": "file:///tmp/vrt-<run>/index.html", "outDir": "/tmp/vrt-<run>", "storyCount": 7, "erroredCount": 0}
+   {"manifestPath": "<repo>/.vrt/<run>/manifest.json", "indexUrl": "file://<repo>/.vrt/<run>/index.html", "outDir": "<repo>/.vrt/<run>", "storyCount": 7, "erroredCount": 0}
    ```
    Capture that. It's the handoff to you.
+
+   The output lives under `<repo>/.vrt/<run-id>/` rather than `/tmp/` so
+   the agent's later Read calls hit cwd-relative paths and don't trigger
+   per-image permission prompts. The script auto-appends `.vrt/` to the
+   repo's `.gitignore` on first run.
 
 4. **Read the manifest.** Each story entry has `files.composite` (side-by-side: **left half = origin/main, right half = working branch**, separated by a 4px black gutter) and `files.diff` (pixelmatch overlay — useful when a vision summary calls out subtle changes, but not required reading).
 
