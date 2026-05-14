@@ -79,7 +79,7 @@ export function renderIndexHtml(manifest, outDir) {
 			</header>
 			<p class="meta">${escape(s.importPath)} · <code>${escape(s.id)}</code></p>
 			<figure>
-				<figcaption>composite (left = origin/main · right = working branch)</figcaption>
+				<figcaption>composite (left = ${escape(manifest.against ?? "base")} · right = working branch)</figcaption>
 				<img src="${rel(outDir, s.files.composite)}" loading="lazy" alt="${escape(s.name)} composite">
 			</figure>
 			${
@@ -189,7 +189,7 @@ export function renderIndexHtml(manifest, outDir) {
 	<p class="summary">
 		<strong>Repo:</strong> <code>${escape(manifest.repo)}</code><br>
 		<strong>Working branch:</strong> <code>${escape(manifest.branchRef.slice(0, 12))}</code> ·
-		<strong>Comparison base:</strong> <code>${escape(manifest.mainRef.slice(0, 12))}</code> (origin/main, merge-base <code>${escape(manifest.mergeBase.slice(0, 12))}</code>)<br>
+		<strong>Comparison base:</strong> <code>${escape((manifest.baseRef ?? manifest.mainRef ?? "").slice(0, 12))}</code> (${escape(manifest.against ?? "origin/main")}, merge-base <code>${escape(manifest.mergeBase.slice(0, 12))}</code>)<br>
 		<strong>Stories:</strong> ${manifest.stories.length} ·
 		<strong>Generated:</strong> ${escape(manifest.generatedAt)}
 	</p>
