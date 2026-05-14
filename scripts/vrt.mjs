@@ -49,24 +49,32 @@ function valued(name, fallback) {
 }
 
 if (flag("help")) {
-	console.log(`vrt — visual regression test against origin/main
+	console.log(`vrt — visual regression test against a git ref
 
 Usage:
-  node vrt.mjs [--all] [--limit N] [--main-port 6006] [--branch-port 6007]
+  node vrt.mjs [--against <ref>] [--all] [--limit N] [--base-port 6006] [--branch-port 6007]
 
 Flags:
+  --against REF      ref to compare HEAD against (default: origin/main).
+                     Accepts anything git rev-parse understands:
+                       origin/main           PR-review baseline (default)
+                       HEAD~1                previous commit on this branch
+                       4f30214               a specific sha
+                       my-other-branch       another local branch
+                       v1.2.0                a tag
   --all              compare every story (default: only stories whose source dir contains changed files)
   --limit N          cap the number of stories
-  --main-port N      port for the origin/main storybook (default 6006)
+  --base-port N      port for the comparison-base storybook (default 6006)
   --branch-port N    port for the working-branch storybook (default 6007)
 `);
 	process.exit(0);
 }
 
+const AGAINST = valued("against", "origin/main");
 const ALL = flag("all");
 const CHANGED_ONLY = !ALL;
 const LIMIT = Number(valued("limit", "0")) || 0;
-const MAIN_PORT = Number(valued("main-port", "6006"));
+const BASE_PORT = Number(valued("base-port", "6006"));
 const BRANCH_PORT = Number(valued("branch-port", "6007"));
 
 // ----- discover repo -----
@@ -91,27 +99,52 @@ if (!pkg.scripts?.storybook) {
 	process.exit(1);
 }
 
-// ----- guard: HEAD vs origin/main -----
-console.error("Fetching origin/main…");
-sh("git fetch origin main --quiet", { cwd: repoRoot });
-const branchRef = sh("git rev-parse HEAD", { cwd: repoRoot });
-const mainRef = sh("git rev-parse origin/main", { cwd: repoRoot });
-const mergeBase = sh("git merge-base origin/main HEAD", { cwd: repoRoot });
+// ----- resolve --against -----
+// Only fetch when the ref points at a remote-tracking branch — otherwise
+// we'd be hitting the network for local refs (HEAD~1, shas, tags). Match
+// `origin/<branch>` shape; anything else is assumed local-resolvable.
+const remoteMatch = AGAINST.match(/^origin\/(.+)$/);
+if (remoteMatch) {
+	console.error(`Fetching ${AGAINST}…`);
+	sh(`git fetch origin "${remoteMatch[1]}" --quiet`, { cwd: repoRoot });
+}
 
-if (branchRef === mainRef) {
-	console.error("HEAD is already at origin/main; nothing to compare.");
+let baseRef;
+try {
+	baseRef = sh(`git rev-parse --verify "${AGAINST}^{commit}"`, {
+		cwd: repoRoot,
+	});
+} catch {
+	console.error(
+		`Could not resolve --against "${AGAINST}". Pass a ref that \`git rev-parse\` understands (e.g. origin/main, HEAD~1, a sha, a branch name, a tag).`,
+	);
+	process.exit(1);
+}
+
+const branchRef = sh("git rev-parse HEAD", { cwd: repoRoot });
+const mergeBase = sh(`git merge-base "${AGAINST}" HEAD`, { cwd: repoRoot });
+
+if (branchRef === baseRef) {
+	console.error(
+		`HEAD is already at ${AGAINST} (${baseRef.slice(0, 8)}); nothing to compare.`,
+	);
 	process.exit(0);
 }
 
 // ----- worktree -----
-const worktreePath = resolve(repoRoot, "..", `${repoName}-vrt-main`);
+// One shared worktree per repo, reset to the requested ref each run.
+// The directory name is intentionally ref-agnostic (`-vrt-base`) so a
+// user switching between `--against origin/main` and `--against HEAD~1`
+// doesn't accumulate multiple worktrees on disk.
+const worktreePath = resolve(repoRoot, "..", `${repoName}-vrt-base`);
 if (!existsSync(worktreePath)) {
 	console.error(`Creating worktree at ${worktreePath}…`);
-	sh(`git worktree add "${worktreePath}" origin/main`, { cwd: repoRoot });
+	sh(`git worktree add --detach "${worktreePath}" "${AGAINST}"`, {
+		cwd: repoRoot,
+	});
 } else {
-	console.error(`Updating existing worktree at ${worktreePath}…`);
-	sh(`git -C "${worktreePath}" fetch origin main --quiet`, { cwd: repoRoot });
-	sh(`git -C "${worktreePath}" reset --hard origin/main`, { cwd: repoRoot });
+	console.error(`Updating existing worktree at ${worktreePath} → ${AGAINST}…`);
+	sh(`git -C "${worktreePath}" reset --hard "${baseRef}"`, { cwd: repoRoot });
 }
 
 // ----- install deps if needed -----
@@ -179,15 +212,17 @@ async function waitForStorybook(port, timeoutMs = 240_000) {
 	throw new Error(`storybook on port ${port} not ready within ${timeoutMs}ms`);
 }
 
-console.error(`Starting storybooks (main on :${MAIN_PORT}, branch on :${BRANCH_PORT})…`);
-const sbMain = spawnStorybook(worktreePath, MAIN_PORT, "main");
+console.error(
+	`Starting storybooks (base "${AGAINST}" on :${BASE_PORT}, branch on :${BRANCH_PORT})…`,
+);
+const sbBase = spawnStorybook(worktreePath, BASE_PORT, "base");
 const sbBranch = spawnStorybook(repoRoot, BRANCH_PORT, "branch");
 
 let cleanedUp = false;
 async function cleanup() {
 	if (cleanedUp) return;
 	cleanedUp = true;
-	for (const p of [sbMain, sbBranch]) {
+	for (const p of [sbBase, sbBranch]) {
 		try {
 			p.kill("SIGTERM");
 		} catch {
@@ -205,7 +240,7 @@ process.on("SIGTERM", () => {
 try {
 	console.error("Waiting for both storybooks to be ready…");
 	const [, branchIndex] = await Promise.all([
-		waitForStorybook(MAIN_PORT),
+		waitForStorybook(BASE_PORT),
 		waitForStorybook(BRANCH_PORT),
 	]);
 
@@ -321,7 +356,10 @@ try {
 	const manifest = {
 		runId,
 		repo: repoRoot,
-		mainRef,
+		// Symbolic ref the user passed (display label).
+		against: AGAINST,
+		// Resolved sha for the comparison base.
+		baseRef,
 		branchRef,
 		mergeBase,
 		generatedAt: new Date().toISOString(),
@@ -333,7 +371,7 @@ try {
 		const storyDir = join(outDir, "stories", safeId);
 		mkdirSync(storyDir, { recursive: true });
 
-		const mainPath = join(storyDir, "main.png");
+		const basePath = join(storyDir, "base.png");
 		const branchPath = join(storyDir, "branch.png");
 		const compositePath = join(storyDir, "composite.png");
 		const diffPath = join(storyDir, "diff.png");
@@ -343,16 +381,16 @@ try {
 		);
 
 		try {
-			await screenshotStory(MAIN_PORT, entry.id, mainPath);
+			await screenshotStory(BASE_PORT, entry.id, basePath);
 			await screenshotStory(BRANCH_PORT, entry.id, branchPath);
 
-			// Composite: side-by-side, main left | branch right, 4px black gutter.
-			const [mainMeta, branchMeta] = await Promise.all([
-				sharp(mainPath).metadata(),
+			// Composite: side-by-side, base left | branch right, 4px black gutter.
+			const [baseMeta, branchMeta] = await Promise.all([
+				sharp(basePath).metadata(),
 				sharp(branchPath).metadata(),
 			]);
-			const w = Math.max(mainMeta.width || 0, branchMeta.width || 0);
-			const h = Math.max(mainMeta.height || 0, branchMeta.height || 0);
+			const w = Math.max(baseMeta.width || 0, branchMeta.width || 0);
+			const h = Math.max(baseMeta.height || 0, branchMeta.height || 0);
 
 			await sharp({
 				create: {
@@ -363,14 +401,14 @@ try {
 				},
 			})
 				.composite([
-					{ input: mainPath, left: 0, top: 0 },
+					{ input: basePath, left: 0, top: 0 },
 					{ input: branchPath, left: w + 4, top: 0 },
 				])
 				.png()
 				.toFile(compositePath);
 
 			// Pixel diff. Crop to common dimensions if they differ.
-			const png1 = PNG.sync.read(readFileSync(mainPath));
+			const png1 = PNG.sync.read(readFileSync(basePath));
 			const png2 = PNG.sync.read(readFileSync(branchPath));
 			let pixelDiffPercent = null;
 			if (png1.width === png2.width && png1.height === png2.height) {
@@ -396,13 +434,13 @@ try {
 				name: entry.name,
 				importPath: entry.importPath,
 				files: {
-					main: mainPath,
+					base: basePath,
 					branch: branchPath,
 					composite: compositePath,
 					diff: pixelDiffPercent === null ? null : diffPath,
 				},
 				dimensions: {
-					main: { w: mainMeta.width, h: mainMeta.height },
+					base: { w: baseMeta.width, h: baseMeta.height },
 					branch: { w: branchMeta.width, h: branchMeta.height },
 				},
 				pixelDiffPercent,
