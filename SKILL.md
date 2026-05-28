@@ -90,6 +90,83 @@ Both commits have the story, so both Storybook instances can render it. The diff
 
 If the user has lumped story + change into a single commit, the script will report `0 stories matched` (the story exists only on the working ref). Suggest they split the commits and re-run.
 
+## Pattern: side-by-side migration story (self-contained, no base ref)
+
+Useful for component-migration PRs where the goal is "show the reviewer every place this component changed, with the old markup and the new markup next to each other." Examples: replacing a local `Alert` lookalike with lanyard's `<Alert>`, swapping a custom `Badge` for the design-system one, migrating from one icon set to another.
+
+The cross-ref VRT workflow above is the wrong shape for this:
+
+- The migration story is *new* — it doesn't exist on `origin/main`, so a branch-vs-base comparison errors out on the base side.
+- The "diff" you want isn't between two storybook renders; it's between the *old* and *new* markup inside a single render. The story IS the comparison.
+
+So the workflow becomes:
+
+1. **Write the story file in the working tree — do not commit it.** Title it like `Migration/<Component> :: Production Callsites`. Inside, render each migrated callsite as a labeled cell with two halves: the pre-migration markup transcribed verbatim on the left, the migrated markup on the right. Keep cells compact — see "Fitting everything in one shot" below.
+2. **Shoot it on the current branch.** No base worktree, no composite. A single storybook instance + one `page.screenshot()` is all you need. Save to a path the user can grab (e.g. `~/Desktop/<migration>.png`).
+3. **Read the shot via vision.** Verify every cell shows the comparison you expect and that no cell is clipped.
+4. **Deliver the image to the user and discard the story file.** The image goes in the PR description (GitHub auto-uploads on drag-drop) — that's where reviewers see it. The story file is a one-shot tool, not a deliverable; don't commit it and don't push it. If the user happened to commit it before realising, `git reset --hard HEAD~1` + force-push undoes it cleanly.
+
+### Fitting everything in one shot
+
+The default screenshot is `fullPage: false` at 1280×720 — anything below 720px is cropped. Three lever to fit all callsites:
+
+- **`fullPage: true`.** Captures the entire document height regardless of viewport. Right answer when the story has > ~8 cells or any cell is unavoidably tall (multi-paragraph content, long lists). The Read tool may downscale very tall images; if a cell is unreadably small, fall back to a multi-cell grid.
+- **2-column grid of cells.** Each cell is itself `[before | after]` internally. Halves the vertical footprint at the cost of horizontal density. Works well up to ~12 cells before becoming cramped.
+- **Trim long-form content inside cells.** The Alert chrome (bg, border, icon, title, description) is usually what's being compared, not the inline content. Replace multi-paragraph bodies with "First sentence…" ellipsis. Drop nested buttons / lists that aren't part of the Alert itself. Note in the cell label what was trimmed.
+
+When in doubt: try the natural layout with `fullPage: true` first — it's the most faithful representation. Switch to grid + trim only if the resulting image is too tall to read comfortably.
+
+### Shooting a single story on the current branch
+
+The cross-ref orchestrator at `scripts/vrt.mjs` always spawns a base worktree. For self-contained migration shots, a much smaller script suffices — write it as `~/.claude/skills/vrt/shoot-story.mjs` to inherit playwright, run once, then delete it:
+
+```js
+// shoot-story.mjs — one-shot screenshot of a story on the current branch.
+// Save image to the user's Desktop so they can drag-drop it into the PR
+// description. The story file itself stays uncommitted in the consumer repo.
+import { chromium } from "playwright";
+import { spawn } from "node:child_process";
+import { setTimeout as sleep } from "node:timers/promises";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+const REPO = "/absolute/path/to/repo";
+const PORT = 6006;
+const STORY_ID = "migration-alert-production-callsites--production-callsites";
+const OUT = path.join(os.homedir(), "Desktop", "migration-shot.png");
+
+const sb = spawn("npm", ["run", "storybook", "--", "--ci", "--port", String(PORT)], {
+  cwd: REPO,
+  stdio: ["ignore", "pipe", "pipe"],
+});
+sb.stdout.on("data", () => {});
+sb.stderr.on("data", () => {});
+
+// Poll the URL until it serves (storybook stdout patterns are unreliable under --ci/--quiet)
+for (let i = 0; i < 300; i++) {
+  try {
+    const r = await fetch(`http://localhost:${PORT}/iframe.html`);
+    if (r.ok) break;
+  } catch { /* not up yet */ }
+  if (i === 299) { sb.kill(); throw new Error("Storybook didn't bind in 300s"); }
+  await sleep(1000);
+}
+await sleep(2000);
+
+const browser = await chromium.launch();
+// deviceScaleFactor: 2 → retina-quality image; helps when reviewers zoom in.
+const page = await (await browser.newContext({ viewport: { width: 1280, height: 720 }, deviceScaleFactor: 2 })).newPage();
+await page.goto(`http://localhost:${PORT}/iframe.html?id=${STORY_ID}&viewMode=story`, { waitUntil: "networkidle" });
+await sleep(1500);
+await fs.writeFile(OUT, await page.screenshot({ fullPage: true /* or false */ }));
+console.log("Wrote", OUT);
+await browser.close();
+sb.kill("SIGTERM");
+```
+
+Run with `node shoot-story.mjs` from `~/.claude/skills/vrt/` (the skill dir has playwright installed). Read the resulting `OUT` path with the Read tool to verify the layout, then hand the path to the user — they drag-drop it into the PR description on github.com, which auto-uploads it to `github.com/user-attachments` and inlines it as a markdown image. Delete the script after.
+
 ## Edge cases
 
 - `Could not resolve --against "<ref>"` → script exits 1 with that message. The user passed something `git rev-parse` doesn't understand; suggest they double-check the ref or pick from the interactive list.
