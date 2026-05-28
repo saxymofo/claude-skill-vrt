@@ -108,13 +108,13 @@ So the workflow becomes:
 
 ### Fitting everything in one shot
 
-The default screenshot is `fullPage: false` at 1280×720 — anything below 720px is cropped. Three lever to fit all callsites:
+The default screenshot is `fullPage: false` at 1280×720 — anything below 720px is cropped. **Reach for `fullPage: true` first**, not a compressed layout:
 
-- **`fullPage: true`.** Captures the entire document height regardless of viewport. Right answer when the story has > ~8 cells or any cell is unavoidably tall (multi-paragraph content, long lists). The Read tool may downscale very tall images; if a cell is unreadably small, fall back to a multi-cell grid.
-- **2-column grid of cells.** Each cell is itself `[before | after]` internally. Halves the vertical footprint at the cost of horizontal density. Works well up to ~12 cells before becoming cramped.
-- **Trim long-form content inside cells.** The Alert chrome (bg, border, icon, title, description) is usually what's being compared, not the inline content. Replace multi-paragraph bodies with "First sentence…" ellipsis. Drop nested buttons / lists that aren't part of the Alert itself. Note in the cell label what was trimmed.
+- **`fullPage: true`.** Captures the entire document height regardless of viewport. Should be the default for migration-comparison shots — it lets you keep production-faithful sizing on every cell, so any visual disparity in the resulting image is a *real* migration outcome rather than a layout artifact. The Read tool may downscale very tall images; if a cell becomes unreadable, drop to fewer cells per shot (split into two stories) rather than compressing.
+- **2-column grid of cells.** Each cell is itself `[before | after]` internally. Halves the vertical footprint at the cost of horizontal density. Works when content is naturally narrow (single-paragraph alerts); avoid when cells have inline buttons or multi-line lists that wrap awkwardly at half-width.
+- **Trim long-form content inside cells.** Only as a last resort, and **only if you trim both halves equivalently**. Trimming only the "before" (or only the "after") to fit a viewport is a false-positive-generator: the resulting image makes the migration look like a typography / padding change when there isn't one. If you must trim, replace prose symmetrically with ellipsis and note it in the cell label.
 
-When in doubt: try the natural layout with `fullPage: true` first — it's the most faithful representation. Switch to grid + trim only if the resulting image is too tall to read comfortably.
+The cardinal rule: **don't introduce visual differences between halves that don't exist in production.** If the only way to fit everything is to compress one side more than the other, switch to `fullPage: true` and accept the taller image.
 
 ### Shooting a single story on the current branch
 
