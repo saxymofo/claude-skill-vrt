@@ -40,6 +40,7 @@ The orchestrator script (`scripts/vrt.mjs`) creates a sibling worktree at the ch
    - `--all` — opt out of the changed-files filter.
    - `--limit N` — cap the number of stories (useful for debugging).
    - `--base-port N` / `--branch-port N` — override the default ports if 6006/6007 conflict.
+   - `--theme dark|light` — capture color scheme. Defaults to the OS theme (macOS `AppleInterfaceStyle`), so a dark-mode dev gets dark captures; also reads `PW_COLOR_SCHEME`. Both branch and ref are shot in the same scheme, so the comparison stays apples-to-apples. (Sets the browser `colorScheme`/`prefers-color-scheme`; a story whose dark mode is class-only with no media fallback may not switch on this alone.)
 
    The script prints a single JSON line on stdout at the end:
    ```json

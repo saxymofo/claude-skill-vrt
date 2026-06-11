@@ -26,6 +26,8 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { execSync } from "node:child_process";
+
 import pixelmatch from "pixelmatch";
 import pngjs from "pngjs";
 import { chromium } from "playwright";
@@ -34,6 +36,26 @@ import sharp from "sharp";
 import { renderIndexHtml } from "./render-index.mjs";
 
 const { PNG } = pngjs;
+
+// Capture in the developer's OS theme so VRT compares what they actually see.
+// Order: --theme dark|light > PW_COLOR_SCHEME env > macOS AppleInterfaceStyle > 'light'.
+// Both the working-branch and comparison-ref captures run in this one process, so
+// they share the scheme — the comparison stays apples-to-apples.
+function detectColorScheme() {
+	const flagIdx = process.argv.indexOf("--theme");
+	const flag = flagIdx !== -1 ? (process.argv[flagIdx + 1] || "") : "";
+	const override = (flag || process.env.PW_COLOR_SCHEME || "").toLowerCase();
+	if (override === "dark" || override === "light") return override;
+	try {
+		const v = execSync("defaults read -g AppleInterfaceStyle 2>/dev/null", {
+			encoding: "utf8",
+		}).trim();
+		return /dark/i.test(v) ? "dark" : "light";
+	} catch {
+		return "light";
+	}
+}
+const COLOR_SCHEME = detectColorScheme();
 
 // ----- arg parsing -----
 const args = process.argv.slice(2);
@@ -333,6 +355,7 @@ try {
 		viewport: { width: 1280, height: 720 },
 		reducedMotion: "reduce",
 		deviceScaleFactor: 1,
+		colorScheme: COLOR_SCHEME, // matches OS theme; override with --theme or PW_COLOR_SCHEME
 	});
 
 	async function screenshotStory(port, storyId, outPath) {
@@ -347,7 +370,7 @@ try {
 				document.fonts ? document.fonts.ready : Promise.resolve(),
 			);
 			await sleep(300);
-			await page.screenshot({ path: outPath, fullPage: false });
+			await page.screenshot({ path: outPath, fullPage: true });
 		} finally {
 			await page.close();
 		}
