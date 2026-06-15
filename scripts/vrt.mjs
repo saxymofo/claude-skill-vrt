@@ -17,6 +17,7 @@
  */
 
 import { spawn, execSync } from "node:child_process";
+import net from "node:net";
 import {
 	existsSync,
 	mkdirSync,
@@ -25,8 +26,6 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-
-import { execSync } from "node:child_process";
 
 import pixelmatch from "pixelmatch";
 import pngjs from "pngjs";
@@ -116,7 +115,7 @@ if (!existsSync(pkgPath)) {
 const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
 if (!pkg.scripts?.storybook) {
 	console.error(
-		'No "storybook" script in package.json. /vrt only supports repos with `npm run storybook`. Aborting.',
+		'No "storybook" script in package.json. /vrt only supports repos with a `storybook` script. Aborting.',
 	);
 	process.exit(1);
 }
@@ -153,12 +152,58 @@ if (branchRef === baseRef) {
 	process.exit(0);
 }
 
+// ----- package manager -----
+// Use whatever package manager the repo uses, detected from its lockfile —
+// running `npm` in a Bun/pnpm/Yarn repo fails (e.g. npm can't resolve versions
+// only published to a private registry the other PM is configured for).
+const LOCKFILES = [
+	["bun.lock", "bun"],
+	["bun.lockb", "bun"],
+	["pnpm-lock.yaml", "pnpm"],
+	["yarn.lock", "yarn"],
+	["package-lock.json", "npm"],
+];
+function detectPackageManager(dir) {
+	for (const [file, pm] of LOCKFILES) {
+		if (existsSync(join(dir, file))) return pm;
+	}
+	return "npm";
+}
+// Lockfile contents for `dir`'s package manager — used to tell whether a reused
+// worktree's deps went stale after we reset it to a different ref.
+function readLock(dir) {
+	for (const [file] of LOCKFILES) {
+		const p = join(dir, file);
+		if (existsSync(p)) return readFileSync(p, "utf8");
+	}
+	return "";
+}
+// `ci`: reproducible install from the lockfile. `fallback`: looser install when
+// there's no lockfile or peers don't align.
+const INSTALL_CMDS = {
+	bun: { ci: "bun install --frozen-lockfile", fallback: "bun install" },
+	pnpm: {
+		ci: "pnpm install --frozen-lockfile --prefer-offline",
+		fallback: "pnpm install",
+	},
+	yarn: { ci: "yarn install --immutable", fallback: "yarn install" },
+	npm: {
+		ci: "npm ci --prefer-offline --no-audit --no-fund",
+		fallback:
+			"npm install --legacy-peer-deps --prefer-offline --no-audit --no-fund",
+	},
+};
+
 // ----- worktree -----
 // One shared worktree per repo, reset to the requested ref each run.
 // The directory name is intentionally ref-agnostic (`-vrt-base`) so a
 // user switching between `--against origin/main` and `--against HEAD~1`
 // doesn't accumulate multiple worktrees on disk.
 const worktreePath = resolve(repoRoot, "..", `${repoName}-vrt-base`);
+// When a reused worktree is reset to a ref whose lockfile differs, its
+// node_modules is stale and must be reinstalled — otherwise the base storybook
+// renders against the wrong deps and the comparison is silently bogus.
+let worktreeDepsStale = false;
 if (!existsSync(worktreePath)) {
 	console.error(`Creating worktree at ${worktreePath}…`);
 	sh(`git worktree add --detach "${worktreePath}" "${AGAINST}"`, {
@@ -166,38 +211,37 @@ if (!existsSync(worktreePath)) {
 	});
 } else {
 	console.error(`Updating existing worktree at ${worktreePath} → ${AGAINST}…`);
+	const lockBefore = readLock(worktreePath);
 	sh(`git -C "${worktreePath}" reset --hard "${baseRef}"`, { cwd: repoRoot });
+	worktreeDepsStale = readLock(worktreePath) !== lockBefore;
+	if (worktreeDepsStale) {
+		console.error("Worktree lockfile changed — reinstalling base deps…");
+	}
 }
 
 // ----- install deps if needed -----
-function ensureDeps(dir) {
-	if (existsSync(join(dir, "node_modules"))) return;
-	console.error(`Installing dependencies in ${dir} (one-time, may take ~1 minute)…`);
-	// Prefer `npm ci` — uses the lockfile exactly, sidesteps peer-dep
-	// resolution. If the project lacks a lockfile or has a peer-dep
-	// conflict that even ci can't paper over, fall back to `npm install
-	// --legacy-peer-deps` which mirrors what npm does when peers don't
-	// quite align (a real-world thing in larger projects).
-	const ciCmd = "npm ci --prefer-offline --no-audit --no-fund";
-	const fallbackCmd =
-		"npm install --legacy-peer-deps --prefer-offline --no-audit --no-fund";
+function ensureDeps(dir, { force = false } = {}) {
+	if (!force && existsSync(join(dir, "node_modules"))) return;
+	const pm = detectPackageManager(dir);
+	const { ci, fallback } = INSTALL_CMDS[pm];
+	console.error(
+		`Installing dependencies in ${dir} with ${pm} (may take ~1 minute)…`,
+	);
 	try {
-		execSync(ciCmd, { cwd: dir, stdio: "inherit" });
+		execSync(ci, { cwd: dir, stdio: "inherit" });
 	} catch {
-		console.error(
-			"`npm ci` failed; retrying with `npm install --legacy-peer-deps`…",
-		);
-		execSync(fallbackCmd, { cwd: dir, stdio: "inherit" });
+		console.error(`\`${ci}\` failed; retrying with \`${fallback}\`…`);
+		execSync(fallback, { cwd: dir, stdio: "inherit" });
 	}
 }
 ensureDeps(repoRoot);
-ensureDeps(worktreePath);
+ensureDeps(worktreePath, { force: worktreeDepsStale });
 
 // ----- storybook spawn -----
 function storybookBin(cwd) {
 	const local = join(cwd, "node_modules", ".bin", "storybook");
 	if (!existsSync(local)) {
-		throw new Error(`storybook binary not found at ${local}; run npm install in ${cwd}`);
+		throw new Error(`storybook binary not found at ${local}; install dependencies in ${cwd}`);
 	}
 	return local;
 }
@@ -234,11 +278,44 @@ async function waitForStorybook(port, timeoutMs = 240_000) {
 	throw new Error(`storybook on port ${port} not ready within ${timeoutMs}ms`);
 }
 
-console.error(
-	`Starting storybooks (base "${AGAINST}" on :${BASE_PORT}, branch on :${BRANCH_PORT})…`,
+// The requested ports are just starting points — a developer often has their
+// own storybook (or a stale one) on 6006/6007. Rather than fail on a taken
+// port, probe upward for the next free one. (Best-effort: a port free at probe
+// time could be grabbed before storybook binds, but the window is tiny.)
+function probePort(port) {
+	return new Promise((res) => {
+		const srv = net.createServer();
+		srv.once("error", () => res(false));
+		srv.once("listening", () => srv.close(() => res(true)));
+		srv.listen(port, "127.0.0.1");
+	});
+}
+async function findFreePort(start, exclude = []) {
+	for (let port = start; port < start + 100; port++) {
+		if (!exclude.includes(port) && (await probePort(port))) return port;
+	}
+	throw new Error(`No free port found in [${start}, ${start + 100}).`);
+}
+const basePort = await findFreePort(BASE_PORT);
+// Keep branch distinct from base even if both defaults resolve to the same gap.
+const branchPort = await findFreePort(
+	BRANCH_PORT === basePort ? basePort + 1 : BRANCH_PORT,
+	[basePort],
 );
-const sbBase = spawnStorybook(worktreePath, BASE_PORT, "base");
-const sbBranch = spawnStorybook(repoRoot, BRANCH_PORT, "branch");
+for (const [label, requested, actual] of [
+	["base", BASE_PORT, basePort],
+	["branch", BRANCH_PORT, branchPort],
+]) {
+	if (actual !== requested) {
+		console.error(`Port ${requested} (${label}) taken — using :${actual}.`);
+	}
+}
+
+console.error(
+	`Starting storybooks (base "${AGAINST}" on :${basePort}, branch on :${branchPort})…`,
+);
+const sbBase = spawnStorybook(worktreePath, basePort, "base");
+const sbBranch = spawnStorybook(repoRoot, branchPort, "branch");
 
 let cleanedUp = false;
 async function cleanup() {
@@ -262,8 +339,8 @@ process.on("SIGTERM", () => {
 try {
 	console.error("Waiting for both storybooks to be ready…");
 	const [, branchIndex] = await Promise.all([
-		waitForStorybook(BASE_PORT),
-		waitForStorybook(BRANCH_PORT),
+		waitForStorybook(basePort),
+		waitForStorybook(branchPort),
 	]);
 
 	// ----- enumerate stories (use branch index as source of truth — new stories are
@@ -404,8 +481,8 @@ try {
 		);
 
 		try {
-			await screenshotStory(BASE_PORT, entry.id, basePath);
-			await screenshotStory(BRANCH_PORT, entry.id, branchPath);
+			await screenshotStory(basePort, entry.id, basePath);
+			await screenshotStory(branchPort, entry.id, branchPath);
 
 			// Composite: side-by-side, base left | branch right, 4px black gutter.
 			const [baseMeta, branchMeta] = await Promise.all([
