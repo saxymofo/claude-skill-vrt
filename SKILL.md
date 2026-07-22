@@ -1,187 +1,160 @@
 ---
 name: vrt
-description: Visual regression test storybook stories on the working branch against any git ref. Defaults to origin/main; pass --against <ref> (or pick interactively) to compare against a previous commit, branch, or tag. Uses vision-based comparison (not pixel-diff thresholds). Default scope is stories whose source directory contains files changed since the comparison ref; pass --all for full coverage. Works in any repo with `npm run storybook`.
+description: Visual regression test a visual change, before vs after. PREFERS capturing the real running app (localdev) with Playwright — navigating to the affected page and, where needed, simulating API responses to trigger the UI condition (as in pr-playwright-verify) — and falls back to Storybook for pure component / design-system changes or when no app is running. Under Claude, presents results as an Artifact with side-by-side before/after columns; emits a single baked composite image only as a fallback for agents without an artifact system. Defaults to comparing against origin/main; pass --against <ref> or pick interactively. Vision-based, per-invocation.
 ---
 
-# /vrt — Visual Regression Test against a git ref
+# /vrt — Visual Regression Test
 
-Compare the visual output of Storybook stories on the working branch against another git ref using vision-based comparison.
+Show what a change looks like **before vs after**, grounded in the real rendered output, and explain each visible difference from the in-context diff.
 
-The orchestrator script (`scripts/vrt.mjs`) creates a sibling worktree at the chosen ref, spawns two storybook instances on different ports, screenshots each story from both, and emits side-by-side composite images plus pixel-diff highlights. **You** then read each composite via the Read tool (vision) and produce a written summary, using the in-context git diff to explain *why* each visible change happened.
+Two independent axes:
 
-## Workflow
+- **Capture** — where the pixels come from. **Prefer the real running app** (localdev) via Playwright; fall back to **Storybook** for pure component/design-system work or when no app is running.
+- **Presentation** — how the user sees the result. **Under Claude Code, build an Artifact with before/after columns** (richer: real side-by-side, per-callsite rows, scrollable, zoomable). A single baked **composite** image is only for environments without the artifact system (Cursor, headless, other agents).
 
-1. **Sanity check.** `pwd` should be a git repo with `npm run storybook` defined. If not, abort with a clear error.
+Decide capture first (real-app vs Storybook), then presentation (artifact vs composite).
 
-2. **Decide the comparison ref.** Parse the user's invocation:
-   - If they passed `--against <ref>`, use it. Skip to step 4.
-   - If they didn't, prompt the user with `AskUserQuestion` before running anything. Gather a curated list:
-     - `origin/main` — default; for PR review
-     - `HEAD~1` — previous commit on this branch (use this with the "add a story commit first, then make the visual change" workflow described in *Comparing against a commit on the working branch* below)
-     - `merge-base with origin/main` — every change on this branch
-     - **Recent commits**: `git log --format='%h %s (%cr)' -7 HEAD` — show 4–5 of them with subjects + relative dates inline
-     - **Enter a different ref…** — escape hatch for arbitrary refs
-   - Resolve the user's choice into a concrete ref string. Use the exact symbolic form they picked (e.g. `HEAD~1`, `4f30214`, `origin/main`) — the script handles all of them.
+## Choosing the capture mode
 
-3. **Install skill dependencies on first run** (once per machine):
+Prefer **real-app** when the change manifests on a page you can reach in the locally running app (localdev) — feature UI, list/detail pages, dialogs, headers, state-dependent rendering. The real app exercises the actual routing, data, theme, and layout the user sees, so the VRT reflects reality, not a story's approximation.
+
+Fall back to **Storybook** when:
+- there's no locally running app (or it's mid-use for something else and a ref switch would disrupt it — see the ref-switch note),
+- the change is in a component that isn't wired into a reachable route (a pure design-system atom/molecule), or
+- the component is new and has no production callsite yet (use the migration-story pattern).
+
+When unsure, ask which mode the user wants, or state your choice and proceed.
+
+---
+
+## Real-app capture (preferred)
+
+Drive the actual running app with Playwright, screenshot the region where the change shows, for both the **after** (working branch) and the **before** (comparison ref).
+
+Reuse the **pr-playwright-verify** machinery — it already solves auth and state:
+- **Auth:** the saved `storageState` at `~/.localdev/pw-auth.json` (run its `ensure-auth.mjs` if missing). One login covers the localdev apps via SSO.
+- **Hosts:** plain HTTP, e.g. `http://console.localdev.keycard.sh`.
+- **State via request interception:** when the change only shows under data/permission/flag/empty/error conditions you don't have, **`page.route` the read response and reshape it** so the UI renders that branch — exactly the pr-playwright-verify technique (fetch the real response, mutate, `route.fulfill`). Scope the route tightly; discover the real wire shape first. This is read-only to the backend and deterministic. Register routes **before** `page.goto`. Never `route.abort()` a mutation the flow depends on.
+
+### Capturing both states
+
+The app serves one checkout at a time, so before/after needs two passes over the **same** navigation + interception script:
+
+1. **After** — on the working branch (already checked out): run the Playwright script, screenshot the affected region(s) to `after-<label>.png`.
+2. **Before** — get the app onto the comparison ref, then re-run the identical script → `before-<label>.png`. Options, cheapest first:
+   - **Interception-only toggle** — if "before/after" is a data/props condition you can express purely by reshaping the intercepted response (not a code change), capture both from the same running branch by varying the `page.route` body. No ref switch. Best case.
+   - **Ref switch on the served checkout** — `git stash` (or `git checkout <ref>`), let localdev live-sync/rebuild (`localdev tilt wait <resource>`), re-run, then restore the branch. **This moves the working tree** — only do it if the checkout is yours to move and the user isn't mid-test on it. Confirm first if unsure.
+   - **Dedicated worktree** the local app is pointed at (advanced) — avoids touching the primary checkout; use when the served checkout must stay put.
+   - If none is safe/feasible, **fall back to the Storybook cross-ref path**, which does two refs cleanly via a base worktree + two ports (below).
+
+Keep both passes byte-identical except the code under test: same viewport, `deviceScaleFactor` (use 2), `colorScheme` (default to the OS theme; Console resolves dark via `localStorage['ui-theme']`), navigation, waits, and interception. Any incidental difference reads as a false regression.
+
+Screenshot the **element/region** that changed (`locator.screenshot()`), not always the full page — a tighter frame makes the before/after columns legible. Read each shot via vision to confirm it captured the intended state and isn't clipped/loading.
+
+---
+
+## Storybook capture (fallback)
+
+### Cross-ref orchestrator — before/after across two git refs
+
+`scripts/vrt.mjs` creates a sibling worktree at the comparison ref, spawns two Storybook instances, screenshots each matching story from both refs, and writes per-side frames + a composite + a pixel-diff overlay. Use it for component/design-system changes that live in stories.
+
+1. **Sanity check.** `pwd` is a git repo with `npm run storybook`. Else abort.
+2. **Decide the ref.** If `--against <ref>` given, use it. Else `AskUserQuestion` with: `origin/main` (default, PR review), `HEAD~1`, `merge-base with origin/main`, recent commits (`git log --format='%h %s (%cr)' -7 HEAD`), and an "enter a ref" escape hatch.
+3. **Install deps on first run:**
    ```bash
    if [ ! -d ~/.claude/skills/vrt/node_modules ]; then
      (cd ~/.claude/skills/vrt && npm install --no-audit --no-fund && npx playwright install chromium)
    fi
    ```
-
-4. **Run the orchestrator** from the user's repo:
+4. **Run** from the repo:
    ```bash
    node ~/.claude/skills/vrt/scripts/vrt.mjs --against <ref> <flags>
    ```
-   Flags:
-   - `--against REF` — ref to compare HEAD against (default `origin/main`; accepts anything `git rev-parse` understands).
-   - default: `--changed-only` (story is included if its source file's directory contains a file changed since the merge-base with `--against`).
-   - `--all` — opt out of the changed-files filter.
-   - `--limit N` — cap the number of stories (useful for debugging).
-   - `--base-port N` / `--branch-port N` — override the default ports if 6006/6007 conflict.
-   - `--theme dark|light` — capture color scheme. Defaults to the OS theme (macOS `AppleInterfaceStyle`), so a dark-mode dev gets dark captures; also reads `PW_COLOR_SCHEME`. Both branch and ref are shot in the same scheme, so the comparison stays apples-to-apples. (Sets the browser `colorScheme`/`prefers-color-scheme`; a story whose dark mode is class-only with no media fallback may not switch on this alone.)
+   Flags: `--against REF` (default `origin/main`); default `--changed-only` (story included if its source dir has a file changed since the merge-base); `--all` for full coverage; `--limit N`; `--base-port`/`--branch-port` (default 6006/6007); `--theme dark|light` (default OS theme; both refs shot in the same scheme). It prints one JSON line: `{manifestPath, indexUrl, outDir, storyCount, erroredCount}`. Output lives under `<repo>/.vrt/<run>/` (auto-gitignored) so later Reads are cwd-relative.
+5. **Read the manifest.** Each entry has the per-side frames, `files.composite` (left = comparison ref, right = working branch, 4px gutter), and `files.diff` (pixelmatch overlay — a hint, not a gate).
+6. For each story, decide if the two states *materially* differ (vision is generous; ignore sub-pixel noise). For changed ones, note what changed + why, grounded in `git diff <against>...HEAD`.
+7. Present per the **Presentation** section — under Claude, feed the per-side frames into an artifact's before/after columns; don't just dump the composite.
+8. Cleanup is automatic; the base worktree is left warm at `../<repo>-vrt-base`.
 
-   The script prints a single JSON line on stdout at the end:
-   ```json
-   {"manifestPath": "<repo>/.vrt/<run>/manifest.json", "indexUrl": "file://<repo>/.vrt/<run>/index.html", "outDir": "<repo>/.vrt/<run>", "storyCount": 7, "erroredCount": 0}
-   ```
-   Capture that. It's the handoff to you.
+**New story not on the base ref?** Split into two commits — Commit A adds the story (no component change), Commit B makes the visual change — then `/vrt --against HEAD~1`. Both refs have the story, so the diff isolates B. (Single lumped commit → `0 stories matched`; suggest the split.)
 
-   The output lives under `<repo>/.vrt/<run-id>/` rather than `/tmp/` so
-   the agent's later Read calls hit cwd-relative paths and don't trigger
-   per-image permission prompts. The script auto-appends `.vrt/` to the
-   repo's `.gitignore` on first run.
+### Migration story — self-contained (no base ref)
 
-5. **Read the manifest.** Each story entry has `files.composite` (side-by-side: **left half = the comparison ref, right half = working branch**, separated by a 4px black gutter) and `files.diff` (pixelmatch overlay — useful when a vision summary calls out subtle changes, but not required reading).
+For migration PRs ("show every place this component changed, old vs new") where the new markup exists on neither ref. Write an **uncommitted** story titled `Migration/<Component>` rendering each callsite as a labeled cell with the pre-migration markup and the migrated markup, shoot it once on the current branch, verify via vision, deliver, then discard the story (don't commit it).
 
-6. **For each story in the manifest:**
-   - Read `files.composite` via the Read tool.
-   - Decide if the two halves *materially* differ. Vision is generous; ignore sub-pixel rendering noise. The accompanying `pixelDiffPercent` is a hint, not a gate (a tiny number can still be a meaningful change if it's a deliberate color shift).
-   - If they differ, write a 1-2 sentence note: what changed visually + what code change caused it. You have `git diff <against>...HEAD` available — use it to ground the explanation.
+**Fitting one shot:** prefer `fullPage: true` over compressing cells (keeps production-faithful sizing so any disparity is real). A 2-column grid of cells halves height when content is narrow. Trim long prose only as a last resort and **only symmetrically** — trimming one side manufactures a false diff. Cardinal rule: never introduce a before/after difference that doesn't exist in production.
 
-7. **Produce the final report**, grouped by component (use story `title` to group). Skip stories that look identical. Top-level: count of changed stories across N components, with a one-sentence theme if the changes form one. Always surface the `indexUrl` so the user can browse the composites + pixel-diffs in a browser:
-   ```
-   ## VRT report — <N> stories changed across <M> components (vs <against>)
+### One-shot shoot script
 
-   <theme summary>
-
-   ### Components/Button
-   - **Primary**: <what changed> — <why>
-   - **Outline**: <what changed> — <why>
-
-   ### …
-
-   _Browse all composites: <indexUrl>_
-   ```
-
-8. **Cleanup is automatic** — the script kills its storybooks on exit. The worktree is left warm at `../<repo>-vrt-base` for the next run. Don't manually delete it.
-
-## Comparing against a commit on the working branch
-
-Useful when you want to verify a visual change to a component that doesn't already have a story on `origin/main` — a Storybook-only comparison can't render a story that doesn't exist in the comparison ref.
-
-The workflow:
-
-1. Commit A: add the Storybook story for the component. No code changes to the component itself.
-2. Commit B: make the visual change you want to verify.
-3. Run `/vrt --against HEAD~1` (or pick "HEAD~1" from the interactive picker).
-
-Both commits have the story, so both Storybook instances can render it. The diff captures only the visual effect of commit B.
-
-If the user has lumped story + change into a single commit, the script will report `0 stories matched` (the story exists only on the working ref). Suggest they split the commits and re-run.
-
-## Pattern: side-by-side migration story (self-contained, no base ref)
-
-Useful for component-migration PRs where the goal is "show the reviewer every place this component changed, with the old markup and the new markup next to each other." Examples: replacing a local `Alert` lookalike with lanyard's `<Alert>`, swapping a custom `Badge` for the design-system one, migrating from one icon set to another.
-
-The cross-ref VRT workflow above is the wrong shape for this:
-
-- The migration story is *new* — it doesn't exist on `origin/main`, so a branch-vs-base comparison errors out on the base side.
-- The "diff" you want isn't between two storybook renders; it's between the *old* and *new* markup inside a single render. The story IS the comparison.
-
-So the workflow becomes:
-
-1. **Write the story file in the working tree — do not commit it.** Title it like `Migration/<Component> :: Production Callsites`. Inside, render each migrated callsite as a labeled cell with two halves: the pre-migration markup transcribed verbatim on the left, the migrated markup on the right. Keep cells compact — see "Fitting everything in one shot" below.
-2. **Shoot it on the current branch.** No base worktree, no composite. A single storybook instance + one `page.screenshot()` is all you need. Save to a path the user can grab (e.g. `~/Desktop/<migration>.png`).
-3. **Read the shot via vision.** Verify every cell shows the comparison you expect and that no cell is clipped.
-4. **Deliver the image to the user and discard the story file.** The image goes in the PR description (GitHub auto-uploads on drag-drop) — that's where reviewers see it. The story file is a one-shot tool, not a deliverable; don't commit it and don't push it. If the user happened to commit it before realising, `git reset --hard HEAD~1` + force-push undoes it cleanly.
-
-### Fitting everything in one shot
-
-The default screenshot is `fullPage: false` at 1280×720 — anything below 720px is cropped. **Reach for `fullPage: true` first**, not a compressed layout:
-
-- **`fullPage: true`.** Captures the entire document height regardless of viewport. Should be the default for migration-comparison shots — it lets you keep production-faithful sizing on every cell, so any visual disparity in the resulting image is a *real* migration outcome rather than a layout artifact. The Read tool may downscale very tall images; if a cell becomes unreadable, drop to fewer cells per shot (split into two stories) rather than compressing.
-- **2-column grid of cells.** Each cell is itself `[before | after]` internally. Halves the vertical footprint at the cost of horizontal density. Works when content is naturally narrow (single-paragraph alerts); avoid when cells have inline buttons or multi-line lists that wrap awkwardly at half-width.
-- **Trim long-form content inside cells.** Only as a last resort, and **only if you trim both halves equivalently**. Trimming only the "before" (or only the "after") to fit a viewport is a false-positive-generator: the resulting image makes the migration look like a typography / padding change when there isn't one. If you must trim, replace prose symmetrically with ellipsis and note it in the cell label.
-
-The cardinal rule: **don't introduce visual differences between halves that don't exist in production.** If the only way to fit everything is to compress one side more than the other, switch to `fullPage: true` and accept the taller image.
-
-### Shooting a single story on the current branch
-
-The cross-ref orchestrator at `scripts/vrt.mjs` always spawns a base worktree. For self-contained migration shots, a much smaller script suffices — write it as `~/.claude/skills/vrt/shoot-story.mjs` to inherit playwright, run once, then delete it:
+The cross-ref orchestrator always spawns a base worktree; for a single story on the current branch, a smaller script suffices. Write it to `~/.claude/skills/vrt/shoot-story.mjs` (inherits the installed playwright), run once, delete it:
 
 ```js
-// shoot-story.mjs — one-shot screenshot of a story on the current branch.
-// Save image to the user's Desktop so they can drag-drop it into the PR
-// description. The story file itself stays uncommitted in the consumer repo.
+// shoot-story.mjs — one story on the current branch → PNG.
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 
 const REPO = "/absolute/path/to/repo";
 const PORT = 6006;
-const STORY_ID = "migration-alert-production-callsites--production-callsites";
-const OUT = path.join(os.homedir(), "Desktop", "migration-shot.png");
+const STORY_ID = "migration-...--...";
+const OUT = "/absolute/out.png";
 
-const sb = spawn("npm", ["run", "storybook", "--", "--ci", "--port", String(PORT)], {
-  cwd: REPO,
-  stdio: ["ignore", "pipe", "pipe"],
-});
-sb.stdout.on("data", () => {});
-sb.stderr.on("data", () => {});
-
-// Poll the URL until it serves (storybook stdout patterns are unreliable under --ci/--quiet)
-for (let i = 0; i < 300; i++) {
-  try {
-    const r = await fetch(`http://localhost:${PORT}/iframe.html`);
-    if (r.ok) break;
-  } catch { /* not up yet */ }
+const sb = spawn("npm", ["run", "storybook", "--", "--ci", "--port", String(PORT)],
+  { cwd: REPO, stdio: ["ignore", "pipe", "pipe"] });
+sb.stdout.on("data", () => {}); sb.stderr.on("data", () => {});
+for (let i = 0; i < 300; i++) {           // poll until it serves (stdout patterns unreliable under --ci)
+  try { if ((await fetch(`http://localhost:${PORT}/iframe.html`)).ok) break; } catch {}
   if (i === 299) { sb.kill(); throw new Error("Storybook didn't bind in 300s"); }
   await sleep(1000);
 }
 await sleep(2000);
-
 const browser = await chromium.launch();
-// deviceScaleFactor: 2 → retina-quality image; helps when reviewers zoom in.
 const page = await (await browser.newContext({ viewport: { width: 1280, height: 720 }, deviceScaleFactor: 2 })).newPage();
 await page.goto(`http://localhost:${PORT}/iframe.html?id=${STORY_ID}&viewMode=story`, { waitUntil: "networkidle" });
 await sleep(1500);
-await fs.writeFile(OUT, await page.screenshot({ fullPage: true /* or false */ }));
+await fs.writeFile(OUT, await page.screenshot({ fullPage: true }));
 console.log("Wrote", OUT);
-await browser.close();
-sb.kill("SIGTERM");
+await browser.close(); sb.kill("SIGTERM");
 ```
 
-Run with `node shoot-story.mjs` from `~/.claude/skills/vrt/` (the skill dir has playwright installed). Read the resulting `OUT` path with the Read tool to verify the layout, then hand the path to the user — they drag-drop it into the PR description on github.com, which auto-uploads it to `github.com/user-attachments` and inlines it as a markdown image. Delete the script after.
+Run from `~/.claude/skills/vrt/`, Read the `OUT` path to verify, delete the script.
+
+---
+
+## Presentation
+
+### Under Claude — Artifact with before/after columns (preferred)
+
+Build an HTML **Artifact** that puts **before** and **after** side by side, one row per story/callsite. This beats a baked composite: the columns are real DOM (responsive, scrollable, zoomable), each screenshot keeps native resolution, and you can label each row and annotate the diff inline.
+
+- Load the **artifact-design** skill first (as always) and give the page a real, calibrated treatment — a utilitarian comparison board, not a flashy hero. Ground the palette in the subject's own tokens where known (e.g. Keycard's dark slate/iris) so it reads as native.
+- Layout: a status/summary header, then per comparison a two-column row (`Before` | `After`) with the two element screenshots and a one-line "what changed + why". Wide shots scroll inside their own `overflow-x:auto` container; images `max-width:100%`.
+- **Inline every image as a `data:` URI** — the artifact CSP blocks external hosts. base64 the PNGs and embed (a generator script avoids pasting base64 by hand). Keep the `<title>` and favicon stable across redeploys; redeploy the same file path to update the same URL as more comparisons land.
+- Hand the user the artifact URL. It's private to them unless they choose to share it.
+
+This is a genuine visual diff surface, so capture **separate** before/after images (element screenshots), not a pre-joined composite — the columns do the joining.
+
+### Fallback — single composite image (agents without artifacts)
+
+When the artifact system isn't available (Cursor, headless, another agent, or a plain PR deliverable), emit one **composite** PNG (before-left | after-right, thin gutter) and Read it via vision — one Read call lets the model compare both halves in a single frame, better for "shifted 2px" observations than two unrelated images. Deliver it by the channel that fits: drag-drop into a PR description (GitHub auto-uploads on drop; `gh` can't attach it), or save to a path the user can open. Use the migration-story/`fullPage` guidance above to fit everything cleanly.
+
+---
+
+## Report
+
+Group by component/page. Skip identical ones. Lead with a count of changed items and a one-line theme if there is one. For each change: what moved + the code cause (from `git diff <against>...HEAD`). Surface the artifact URL (Claude) or the composite path/`indexUrl` (fallback). Flag a "pixel-identical" result on a **spacing/token** swap as suspicious — it can mean an off-scale value was preserved instead of the canonical token being adopted; check the intent.
 
 ## Edge cases
 
-- `Could not resolve --against "<ref>"` → script exits 1 with that message. The user passed something `git rev-parse` doesn't understand; suggest they double-check the ref or pick from the interactive list.
-- `0 stories matched the changed-only filter` → the script prints that message and exits 0. Tell the user, suggest `/vrt --all` if they want full coverage.
-- `HEAD is already at <ref>` → script exits 0 with that message. Nothing to compare.
-- A story with `error` in the manifest entry (instead of `files`) → screenshot failed in one branch. Surface it under a "Stories that errored" section; don't try to vision-read the missing image.
-- First run will be slow: skill deps install (~30s), playwright chromium download (~50MB), worktree creation, two storybook builds in parallel, then dependency install in the worktree if not already there. Subsequent runs reuse all of that.
-
-## Why side-by-side composites instead of two separate images
-
-One Read call per story instead of two. The vision model compares both halves in a single frame, which is much better at "padding shifted by 2px on the right" type observations than reading two unrelated images and trying to remember the first.
+- `Could not resolve --against "<ref>"` / `0 stories matched` / `HEAD is already at <ref>` — the orchestrator exits with the message; relay it (suggest `--all` for the 0-match case).
+- Manifest entry with `error` instead of frames — a screenshot failed on one ref; surface under "errored", don't vision-read the missing image.
+- Real-app "before" needs a ref switch you can't safely do (checkout in use) → fall back to the Storybook cross-ref path, or capture only "after" and say so.
+- localdev not running / app resource not Ready → tell the user to bring it up; don't start it yourself unless asked.
+- First orchestrator run is slow (deps install, chromium download, two Storybook builds); later runs reuse them.
 
 ## Out of scope
 
-- App-level VRT against running localdev pages. Storybook only — no backend dependency.
-- Cross-viewport comparisons. Single 1280×720 viewport. (Easy to extend if needed.)
-- Persistent baselines / Chromatic-style approval workflow. This skill is per-invocation; the agent's report is the artifact.
+- Cross-viewport matrices — single viewport per run (extendable).
+- Persistent baselines / Chromatic-style approval — this skill is per-invocation; the artifact (or composite) + report is the deliverable.
